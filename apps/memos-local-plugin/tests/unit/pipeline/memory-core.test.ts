@@ -1189,4 +1189,101 @@ describe("bootstrapMemoryCore", () => {
     expect(meta.reward?.traceCount).toBe(1);
     expect(meta.reward?.traceIds).toEqual(["tr_missing_reward"]);
   });
+
+  it("rescoring closed episodes that were abandoned rather than finalized", async () => {
+    // Regression: pre-fix, episodes with closeReason="abandoned" were silently
+    // excluded from the bootstrap dirty-rescore scan, so the vast majority of
+    // closed traces never received an r_human score (see GH#1782).
+    home = await makeTmpHome({ agent: "openclaw" });
+
+    const seeder = await bootstrapMemoryCore({
+      agent: "openclaw",
+      home: home.home,
+      config: home.config,
+      pkgVersion: "abandoned-seed",
+    });
+    await seeder.init();
+    await seeder.shutdown();
+
+    const Sqlite = (await import("better-sqlite3")).default;
+    const writeDb = new Sqlite(home.home.dbFile);
+    const ts = Date.now() - 1_000;
+    writeDb
+      .prepare(
+        `INSERT INTO sessions (id, agent, started_at, last_seen_at, meta_json) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("se_abandoned", "openclaw", ts, ts, "{}");
+    writeDb
+      .prepare(
+        `INSERT INTO episodes (id, session_id, started_at, ended_at, trace_ids_json, r_task, status, meta_json) VALUES (?, ?, ?, ?, ?, ?, 'closed', ?)`,
+      )
+      .run(
+        "ep_abandoned",
+        "se_abandoned",
+        ts,
+        ts + 1,
+        JSON.stringify(["tr_abandoned"]),
+        null,
+        JSON.stringify({ closeReason: "abandoned" }),
+      );
+    writeDb
+      .prepare(
+        `INSERT INTO traces (
+          id, episode_id, session_id, ts, user_text, agent_text, summary,
+          tool_calls_json, reflection, agent_thinking, value, alpha, r_human,
+          priority, tags_json, error_signatures_json, vec_summary, vec_action,
+          share_scope, share_target, shared_at, turn_id, schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+      )
+      .run(
+        "tr_abandoned",
+        "ep_abandoned",
+        "se_abandoned",
+        ts,
+        "上海骨科医院推荐",
+        "上海六院、长征医院、华山医院等骨科较强，可按创伤、脊柱、手外科方向选择。",
+        "上海骨科医院推荐",
+        "[]",
+        null,
+        null,
+        0,
+        0,
+        null,
+        0.5,
+        "[]",
+        "[]",
+        ts,
+        1,
+      );
+    writeDb.close();
+
+    core = await bootstrapMemoryCore({
+      agent: "openclaw",
+      home: home.home,
+      config: home.config,
+      pkgVersion: "abandoned-recover",
+    });
+    await core.init();
+
+    const readDb = new Sqlite(home.home.dbFile, { readonly: true });
+    const episode = readDb
+      .prepare("SELECT r_task, meta_json FROM episodes WHERE id = ?")
+      .get("ep_abandoned") as { r_task: number | null; meta_json: string } | undefined;
+    readDb.close();
+
+    expect(episode).toBeDefined();
+    expect(episode!.r_task).toBe(0);
+    const meta = JSON.parse(episode!.meta_json) as {
+      recoveryReason?: string;
+      closeReason?: string;
+      reward?: { traceCount?: number; traceIds?: string[] };
+    };
+    // recoverDirtyClosedEpisodes overwrites closeReason to "finalized" after
+    // rescoring; the regression we care about is that the episode was
+    // *picked up* by the dirty scan in the first place, evidenced by
+    // recoveryReason and the populated reward block.
+    expect(meta.recoveryReason).toBe("dirty_reward_rescore");
+    expect(meta.reward?.traceCount).toBe(1);
+    expect(meta.reward?.traceIds).toEqual(["tr_abandoned"]);
+  });
 });

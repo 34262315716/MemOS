@@ -538,6 +538,13 @@ export function createMemoryCore(
   );
   let lastStaleScan = 0;
   let lastDirtyClosedScan = 0;
+  let rescoreInterval: ReturnType<typeof setInterval> | null = null;
+  // Periodic dirty-closed rescore: bootstrap-only scoring misses episodes
+  // that get closed after init(), and any abandoned/finalized episode that
+  // hits a transient reward-pipeline failure stays dirty forever without a
+  // retry loop. 10 minutes is paired with the 30-second dedup guard inside
+  // `autoRescoreDirtyClosedEpisodes` to keep the cost negligible.
+  const RESCORE_INTERVAL_MS = 10 * 60 * 1000;
   async function autoFinalizeStaleTasks(): Promise<void> {
     const nowMs = Date.now();
     if (nowMs - lastStaleScan < 30_000) return;
@@ -630,6 +637,22 @@ export function createMemoryCore(
       log.debug("init.orphan_scan.failed", {
         err: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Polling fallback so abandoned / future-closed episodes that miss the
+    // bootstrap scan still get scored, and reward-pipeline failures get a
+    // chance to retry. The 30 s dedup guard inside
+    // `autoRescoreDirtyClosedEpisodes` keeps overlapping scans cheap.
+    if (rescoreInterval === null) {
+      rescoreInterval = setInterval(() => {
+        if (shutDown) return;
+        void autoRescoreDirtyClosedEpisodes().catch((err) => {
+          log.debug("periodic_rescore.error", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, RESCORE_INTERVAL_MS);
+      (rescoreInterval as unknown as { unref?: () => void }).unref?.();
     }
 
     // Wire `memory_add` into the api_logs table on EVERY turn so the
@@ -977,7 +1000,9 @@ export function createMemoryCore(
     if (
       ep.rTask == null &&
       (ep.traceIds?.length ?? 0) > 0 &&
-      (meta.closeReason === "finalized" || meta.recoveryReason === "missed_session_end")
+      (meta.closeReason === "finalized" ||
+        meta.closeReason === "abandoned" ||
+        meta.recoveryReason === "missed_session_end")
     ) {
       return true;
     }
@@ -1105,6 +1130,10 @@ export function createMemoryCore(
   async function shutdown(): Promise<void> {
     if (shutDown) return;
     shutDown = true;
+    if (rescoreInterval !== null) {
+      clearInterval(rescoreInterval);
+      rescoreInterval = null;
+    }
     try {
       await handle.shutdown("memory-core.shutdown");
     } finally {
