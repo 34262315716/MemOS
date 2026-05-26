@@ -154,4 +154,108 @@ describe("storage/migrator", () => {
       db.close();
     }
   });
+
+  /**
+   * Regression guard for the v2.0.2 bootstrap-hang bug
+   * (https://github.com/MemTensor/MemOS/issues/1787).
+   *
+   * The original namespace-visibility migration ran a blanket
+   * `UPDATE traces SET share_scope='private' WHERE share_scope IS NULL`,
+   * which on multi-hundred-MB databases rewrote every trace row inside
+   * one synchronous transaction. CPU pegged at 100 % for minutes and
+   * the bridge never reached `migrations.summary`.
+   *
+   * After the fix the migration must not issue that UPDATE on rows
+   * whose `share_scope` is already NULL. The read path normalises
+   * NULL to `'private'` via COALESCE, so leaving NULLs in place is
+   * functionally equivalent — and dramatically cheaper, because no
+   * row data has to be rewritten.
+   *
+   * To distinguish "no UPDATE issued" from "UPDATE issued but no rows
+   * matched", we pre-build the schema with `share_scope` already
+   * present and a row explicitly set to NULL: if the legacy UPDATE is
+   * still there it will normalise that row to `'private'`, otherwise
+   * the NULL stays untouched.
+   */
+  it("does not rewrite share_scope rows on the namespace-visibility migration", () => {
+    const { dbPath, cleanup } = tmpDb();
+    cleanups.push(cleanup);
+
+    const db = openDb({ filepath: dbPath, agent: "openclaw" });
+    try {
+      // Pre-007 schema slice with `share_scope` already created so we
+      // can pre-seed an explicit NULL row. All later migrations are
+      // marked as applied because this test is about 007's row
+      // behaviour, not about re-running the full migration ladder.
+      db.exec(`
+        CREATE TABLE schema_migrations (
+          version     INTEGER PRIMARY KEY,
+          name        TEXT    NOT NULL,
+          applied_at  INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE traces (
+          id            TEXT PRIMARY KEY,
+          ts            INTEGER NOT NULL,
+          share_scope   TEXT,
+          user_text     TEXT NOT NULL DEFAULT '',
+          agent_text    TEXT NOT NULL DEFAULT ''
+        ) STRICT;
+        CREATE TABLE episodes (
+          id          TEXT PRIMARY KEY,
+          started_at  INTEGER NOT NULL,
+          status      TEXT NOT NULL DEFAULT 'open'
+        ) STRICT;
+        CREATE TABLE policies (
+          id          TEXT PRIMARY KEY,
+          updated_at  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+        CREATE TABLE world_model (
+          id          TEXT PRIMARY KEY,
+          updated_at  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+        CREATE TABLE skills (
+          id          TEXT PRIMARY KEY,
+          name        TEXT NOT NULL DEFAULT '',
+          updated_at  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+        INSERT INTO schema_migrations(version, name, applied_at) VALUES
+          (1, 'initial', 0),
+          (2, 'embedding-retry-queue', 0),
+          (3, 'embedding-retry-lease', 0),
+          (4, 'skill-usage', 0),
+          (5, 'skill-trials', 0),
+          (6, 'world-model-version', 0),
+          (8, 'feedback-experience-metadata', 0),
+          (9, 'policies-fts', 0);
+        INSERT INTO traces(id, ts, share_scope) VALUES
+          ('t-null-a',   1, NULL),
+          ('t-null-b',   2, NULL),
+          ('t-private',  3, 'private'),
+          ('t-public',   4, 'public');
+      `);
+
+      const result = runMigrations(db);
+
+      // Migration 007 must register as applied so we never re-enter the
+      // (formerly very slow) backfill path on subsequent boots.
+      expect(result.applied.map((m) => m.version)).toContain(7);
+
+      const rows = db
+        .prepare<unknown, { id: string; share_scope: string | null }>(
+          `SELECT id, share_scope FROM traces ORDER BY id`,
+        )
+        .all();
+      // The crucial assertion: NULL stays NULL. If the legacy bulk
+      // UPDATE were still in place the two `t-null-*` rows would have
+      // been rewritten to 'private'. Non-NULL rows are untouched.
+      expect(rows).toEqual([
+        { id: "t-null-a", share_scope: null },
+        { id: "t-null-b", share_scope: null },
+        { id: "t-private", share_scope: "private" },
+        { id: "t-public", share_scope: "public" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
 });

@@ -109,6 +109,40 @@ export function makeTracesRepo(db: StorageDb) {
       return rows.map(mapRow);
     },
 
+    /**
+     * Cheap existence check: does ANY trace in `ids` carry a timestamp
+     * strictly greater than `ts`?
+     *
+     * Designed for the startup "dirty-closed-episode" scan in
+     * `memory-core.init()`. The previous implementation fetched every
+     * trace row in full — including the `vec_summary` / `vec_action`
+     * BLOBs and the (potentially huge) `tool_calls_json` column — just
+     * to inspect a single number. On a multi-hundred-MB database with
+     * a few hundred closed episodes that hydrates hundreds of MB of
+     * rows into Node memory and burns CPU re-parsing every JSON blob,
+     * which is what the bug reported under
+     * https://github.com/MemTensor/MemOS/issues/1787 calls out as
+     * "orphan detection walking the entire table."
+     *
+     * The replacement issues a single `SELECT 1 ... LIMIT 1` per chunk
+     * of ids and stops as soon as it finds a hit.
+     */
+    hasAnyNewerThan(ids: readonly TraceId[], ts: number): boolean {
+      if (ids.length === 0) return false;
+      // Chunked so we never blow past SQLite's default 999-parameter limit.
+      const CHUNK = 500;
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const chunk = ids.slice(i, i + CHUNK);
+        const placeholders = buildInClause(chunk.length);
+        const sql = `SELECT 1 FROM traces WHERE id ${placeholders} AND ts > ? LIMIT 1`;
+        const hit = db
+          .prepare<readonly unknown[], { 1: number }>(sql)
+          .get([...chunk, ts]);
+        if (hit) return true;
+      }
+      return false;
+    },
+
     list(filter: TraceListFilter = {}): TraceRow[] {
       const tr = timeRangeWhere(filter, "ts");
       const fragments: string[] = [];
