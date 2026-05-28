@@ -1321,6 +1321,38 @@ class ExistMemCubeIdResponse(BaseResponse[dict[str, bool]]):
     """Response model for checking if mem cube id exists."""
 
 
+class CreateCubeRequest(BaseRequest):
+    """Request model for explicitly creating a mem cube.
+
+    Creating a cube up-front is required for multi-tenant / multi-cube
+    deployments: without an explicit cube registration, ``/product/add``
+    will succeed (writing embeddings to the vector store) but
+    ``/product/search`` will return empty results because the tree
+    registry has no entry for the cube. See Issue #1681 for context.
+    """
+
+    cube_id: str = Field(..., description="Unique identifier for the new cube")
+    owner_id: str = Field(
+        ...,
+        description=(
+            "User ID that owns the cube. Currently used as a marker tag on the cube; "
+            "future versions may use it for access control."
+        ),
+    )
+    cube_name: str | None = Field(
+        None,
+        description="Human-readable name. Defaults to ``cube_id`` if not provided.",
+    )
+
+
+class CreateCubeResponse(BaseResponse[dict[str, Any]]):
+    """Response model for creating a mem cube.
+
+    ``data`` always contains ``cube_id`` and a ``created`` boolean. ``created``
+    is ``False`` when the cube already existed (idempotent path).
+    """
+
+
 class DeleteMemoryByRecordIdRequest(BaseRequest):
     """Request model for deleting memory by record id."""
 

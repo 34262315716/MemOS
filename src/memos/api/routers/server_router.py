@@ -32,6 +32,8 @@ from memos.api.product_models import (
     ChatBusinessRequest,
     ChatPlaygroundRequest,
     ChatRequest,
+    CreateCubeRequest,
+    CreateCubeResponse,
     DeleteMemoryByRecordIdRequest,
     DeleteMemoryByRecordIdResponse,
     DeleteMemoryRequest,
@@ -95,6 +97,47 @@ redis_client = components["redis_client"]
 status_tracker = TaskStatusTracker(redis_client=redis_client)
 graph_db = components["graph_db"]
 
+# Opt-in flag: when enabled, /product/add and /product/search return 404 if an
+# explicit ``mem_cube_id`` / ``writable_cube_ids`` / ``readable_cube_ids`` refers
+# to a cube that has not been registered via /product/create_cube. Default is
+# off to preserve backward compatibility; see Issue #1681.
+STRICT_CUBE_VALIDATION = os.getenv("MEMOS_STRICT_CUBE_VALIDATION", "false").lower() == "true"
+
+
+def _cube_exists(cube_id: str) -> bool:
+    """Return True if the cube has been registered (or had memories written)."""
+    if not cube_id:
+        return False
+    try:
+        return bool(graph_db.exist_user_name(user_name=cube_id).get(cube_id, False))
+    except Exception:
+        # If the registry is unavailable, fall back to allowing the request
+        # rather than blocking it. The underlying handler will surface the
+        # real error.
+        logger.warning("Cube existence check failed; skipping validation.", exc_info=True)
+        return True
+
+
+def _validate_cube_or_404(cube_ids: list[str]) -> None:
+    """Raise HTTP 404 with a clear message if any cube id is missing.
+
+    Only checks explicit cube ids — callers should skip implicit defaults
+    (e.g. when the request didn't set ``mem_cube_id`` and the handler is
+    falling back to ``user_id``).
+    """
+    if not STRICT_CUBE_VALIDATION:
+        return
+    missing = [cid for cid in cube_ids if cid and not _cube_exists(cid)]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Cube {missing[0]!r} does not exist. Create it via "
+                "POST /product/create_cube or omit mem_cube_id to use the "
+                "default cube."
+            ),
+        )
+
 
 # =============================================================================
 # Search API Endpoints
@@ -107,7 +150,21 @@ def search_memories(search_req: APISearchRequest):
     Search memories for a specific user.
 
     This endpoint uses the class-based SearchHandler for better code organization.
+
+    When ``MEMOS_STRICT_CUBE_VALIDATION`` is enabled, an explicit
+    ``mem_cube_id`` / ``readable_cube_ids`` referring to a cube that has
+    not been registered will return HTTP 404 instead of an empty result.
     """
+    # Only validate explicit cube ids — when neither mem_cube_id nor
+    # readable_cube_ids is set, the handler implicitly falls back to user_id,
+    # which is the legacy default behaviour we must preserve.
+    explicit_cube_ids: list[str] = []
+    if search_req.mem_cube_id:
+        explicit_cube_ids.append(search_req.mem_cube_id)
+    if search_req.readable_cube_ids:
+        explicit_cube_ids.extend(search_req.readable_cube_ids)
+    _validate_cube_or_404(explicit_cube_ids)
+
     search_results = search_handler.handle_search_memories(search_req)
     return search_results
 
@@ -123,7 +180,19 @@ def add_memories(add_req: APIADDRequest):
     Add memories for a specific user.
 
     This endpoint uses the class-based AddHandler for better code organization.
+
+    When ``MEMOS_STRICT_CUBE_VALIDATION`` is enabled, an explicit
+    ``mem_cube_id`` / ``writable_cube_ids`` referring to a cube that has
+    not been registered will return HTTP 404 instead of silently writing
+    to an orphan partition.
     """
+    explicit_cube_ids: list[str] = []
+    if add_req.mem_cube_id:
+        explicit_cube_ids.append(add_req.mem_cube_id)
+    if add_req.writable_cube_ids:
+        explicit_cube_ids.extend(add_req.writable_cube_ids)
+    _validate_cube_or_404(explicit_cube_ids)
+
     return add_handler.handle_add_memories(add_req)
 
 
@@ -389,6 +458,70 @@ def exist_mem_cube_id(request: ExistMemCubeIdRequest):
         code=200,
         message="Successfully",
         data=graph_db.exist_user_name(user_name=request.mem_cube_id),
+    )
+
+
+@router.post(
+    "/create_cube",
+    summary="Create / register a mem cube",
+    response_model=CreateCubeResponse,
+)
+def create_cube(request: CreateCubeRequest):
+    """Explicitly create / register a mem cube.
+
+    Server-mode HTTP API previously accepted arbitrary ``mem_cube_id`` values
+    on :http:post:`/product/add` but did not register the cube in the tree
+    registry, so subsequent :http:post:`/product/search` calls returned
+    empty results even though data was written to the vector store. See
+    Issue #1681 for context.
+
+    This endpoint is idempotent — calling it twice with the same
+    ``cube_id`` returns ``created=False`` on the second call without
+    raising.
+    """
+    cube_id = request.cube_id
+    owner_id = request.owner_id
+
+    if not cube_id:
+        raise HTTPException(status_code=400, detail="cube_id must be a non-empty string")
+
+    if hasattr(graph_db, "create_user_name"):
+        try:
+            created = bool(graph_db.create_user_name(user_name=cube_id, owner_id=owner_id))
+        except Exception as e:
+            logger.error("Failed to create cube %s: %s", cube_id, e, exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create cube {cube_id!r}: {e}",
+            ) from e
+    else:
+        # Backwards-compatibility shim for graph_db backends that have not
+        # adopted the create_user_name extension yet: treat the cube as
+        # registered if any memory exists for it; otherwise report
+        # not-implemented so integrators see a clear signal.
+        existing = bool(graph_db.exist_user_name(user_name=cube_id).get(cube_id, False))
+        if existing:
+            created = False
+        else:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "The active graph_db backend does not support explicit cube "
+                    "creation. Upgrade to a backend that implements "
+                    "create_user_name, or add a memory via /product/add to "
+                    "implicitly register the cube."
+                ),
+            )
+
+    return CreateCubeResponse(
+        code=200,
+        message="Cube created" if created else "Cube already exists",
+        data={
+            "cube_id": cube_id,
+            "cube_name": request.cube_name or cube_id,
+            "owner_id": owner_id,
+            "created": created,
+        },
     )
 
 

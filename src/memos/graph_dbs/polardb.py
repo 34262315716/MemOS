@@ -5044,6 +5044,53 @@ class PolarDBGraphDB(BaseGraphDB):
             )
             raise
 
+    def create_user_name(self, user_name: str, owner_id: str | None = None) -> bool:
+        """Register a cube (``user_name``) in the graph.
+
+        Creates an idempotent marker Memory node so that subsequent calls to
+        :meth:`exist_user_name` return ``True``. The marker has a
+        deterministic id (``_cube_marker:<user_name>``) and is tagged with
+        ``node_type='cube_marker'`` so it is not surfaced in regular search
+        results.
+
+        Args:
+            user_name: The cube id / user_name to register.
+            owner_id: Optional owner identifier stored as metadata on the
+                marker node.
+
+        Returns:
+            bool: ``True`` if a new marker was created, ``False`` if the
+            cube was already registered.
+        """
+        if not user_name:
+            raise ValueError("user_name must be a non-empty string")
+
+        if self.exist_user_name(user_name).get(user_name):
+            logger.info(f"[create_user_name] Cube {user_name} already exists; create is a no-op.")
+            return False
+
+        marker_id = f"_cube_marker:{user_name}"
+        try:
+            # Use add_node so that connection/auth/escape logic stays in
+            # one place. The marker node carries ``node_type='cube_marker'``
+            # so search/scroll routines can skip it.
+            self.add_node(
+                id=marker_id,
+                memory="",
+                metadata={
+                    "node_type": "cube_marker",
+                    "owner_id": owner_id or "",
+                },
+                user_name=user_name,
+            )
+            logger.info(f"[create_user_name] Registered cube marker for user_name {user_name}")
+            return True
+        except Exception as e:
+            logger.error(
+                f"[create_user_name] Failed to register cube {user_name}: {e}", exc_info=True
+            )
+            raise
+
     @timed
     def delete_node_by_mem_cube_id(
         self,

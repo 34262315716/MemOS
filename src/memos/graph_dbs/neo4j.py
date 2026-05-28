@@ -2109,6 +2109,62 @@ class Neo4jGraphDB(BaseGraphDB):
             )
             raise
 
+    def create_user_name(self, user_name: str, owner_id: str | None = None) -> bool:
+        """Register a cube (``user_name``) in the graph.
+
+        Creates an idempotent marker :Memory node so that subsequent calls
+        to :meth:`exist_user_name` return ``True`` and so that the tree
+        retriever has a registered partition for the cube. The marker has
+        a deterministic id (``_cube_marker:<user_name>``) to avoid
+        duplicates and is excluded from normal search by carrying a
+        ``node_type`` of ``"cube_marker"``.
+
+        Args:
+            user_name: The cube id / user_name to register.
+            owner_id: Optional owner identifier stored as metadata on the
+                marker node.
+
+        Returns:
+            bool: ``True`` if a new marker was created, ``False`` if the
+            cube was already registered.
+        """
+        if not user_name:
+            raise ValueError("user_name must be a non-empty string")
+
+        # Don't create a marker if any memory already exists for this cube.
+        if self.exist_user_name(user_name).get(user_name):
+            logger.info(f"[create_user_name] Cube {user_name} already exists; create is a no-op.")
+            return False
+
+        marker_id = f"_cube_marker:{user_name}"
+        query = """
+            MERGE (n:Memory {id: $id})
+            ON CREATE SET
+                n.memory = $memory,
+                n.user_name = $user_name,
+                n.owner_id = $owner_id,
+                n.node_type = 'cube_marker',
+                n.created_at = datetime(),
+                n.updated_at = datetime()
+            RETURN n.id AS id
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                session.run(
+                    query,
+                    id=marker_id,
+                    memory="",
+                    user_name=user_name,
+                    owner_id=owner_id or "",
+                )
+            logger.info(f"[create_user_name] Registered cube marker for user_name {user_name}")
+            return True
+        except Exception as e:
+            logger.error(
+                f"[create_user_name] Failed to register cube {user_name}: {e}", exc_info=True
+            )
+            raise
+
     def delete_node_by_mem_cube_id(
         self,
         mem_cube_id: str | None = None,
