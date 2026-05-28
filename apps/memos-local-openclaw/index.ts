@@ -14,6 +14,7 @@ import { fileURLToPath } from "url";
 import { buildContext } from "./src/config";
 import type { HostModelsConfig } from "./src/openclaw-api";
 import { ensureSqliteBinding } from "./src/storage/ensure-binding";
+import { rebuildBetterSqlite3 } from "./src/storage/rebuild-native";
 import { SqliteStore } from "./src/storage/sqlite";
 import { Embedder } from "./src/embedding";
 import { IngestWorker } from "./src/ingest/worker";
@@ -166,7 +167,6 @@ const memosLocalPlugin = {
 
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     const localRequire = createRequire(import.meta.url);
-    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
     function detectPluginDir(startDir: string): string {
       let cur = startDir;
@@ -193,40 +193,86 @@ const memosLocalPlugin = {
       return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
     }
 
-    function runNpm(args: string[]) {
-      const { spawnSync } = localRequire("child_process") as typeof import("node:child_process");
-      return spawnSync(npmCmd, args, {
-        cwd: pluginDir,
-        stdio: "pipe",
-        shell: false,
-        timeout: 120_000,
-      });
-    }
+    /**
+     * Try to load better-sqlite3 from the plugin directory.
+     *
+     * Returns:
+     *  - { ok: true }
+     *  - { ok: false, reason: "missing" }            — module not found
+     *  - { ok: false, reason: "abi-mismatch" }       — NODE_MODULE_VERSION mismatch (Issue #1734)
+     *  - { ok: false, reason: "load-error" }         — other native load failure
+     *  - { ok: false, reason: "outside-plugin-dir" } — resolved to a path outside the plugin
+     */
+    type SqliteLoadResult =
+      | { ok: true }
+      | { ok: false; reason: "missing" | "abi-mismatch" | "load-error" | "outside-plugin-dir"; message?: string };
 
-    let sqliteReady = false;
-
-    function trySqliteLoad(): boolean {
+    function trySqliteLoad(): SqliteLoadResult {
+      let resolved: string;
       try {
-        const resolved = localRequire.resolve("better-sqlite3", { paths: [pluginDir] });
-        const resolvedReal = fs.existsSync(resolved) ? fs.realpathSync.native(resolved) : resolved;
-        if (!isPathInside(pluginDir, resolvedReal)) {
-          api.logger.warn(`memos-local: better-sqlite3 resolved outside plugin dir: ${resolved}`);
-          return false;
-        }
+        resolved = localRequire.resolve("better-sqlite3", { paths: [pluginDir] });
+      } catch (err) {
+        return { ok: false, reason: "missing", message: err instanceof Error ? err.message : String(err) };
+      }
+
+      const resolvedReal = fs.existsSync(resolved) ? fs.realpathSync.native(resolved) : resolved;
+      if (!isPathInside(pluginDir, resolvedReal)) {
+        api.logger.warn(`memos-local: better-sqlite3 resolved outside plugin dir: ${resolved}`);
+        return { ok: false, reason: "outside-plugin-dir", message: resolved };
+      }
+
+      try {
         localRequire(resolvedReal);
-        return true;
-      } catch {
-        return false;
+        return { ok: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Native ABI mismatch — the compiled .node was built against a different
+        // Node.js NODE_MODULE_VERSION than the one currently running the Gateway.
+        // Issue #1734: this is the case we have to fix by rebuilding against the
+        // *current* Node binary, not whatever `npm` on PATH would pick up.
+        if (/NODE_MODULE_VERSION/.test(message)) {
+          return { ok: false, reason: "abi-mismatch", message };
+        }
+        return { ok: false, reason: "load-error", message };
       }
     }
 
-    sqliteReady = trySqliteLoad();
+    let loadResult = trySqliteLoad();
+    let sqliteReady = loadResult.ok;
+
+    // Helper that reads `reason` / `message` off a possibly-narrowed
+    // discriminated union without fighting TS narrowing through a mutable
+    // `let` binding.
+    const failureInfo = (
+      r: SqliteLoadResult,
+    ): { reason: string; message: string } => {
+      if (r.ok) return { reason: "unknown", message: "" };
+      return { reason: r.reason, message: r.message ?? "" };
+    };
 
     if (!sqliteReady) {
-      api.logger.warn(`memos-local: better-sqlite3 not found in ${pluginDir}, attempting auto-rebuild ...`);
+      const initial = failureInfo(loadResult);
+      const nodeAbi = process.versions.modules;
+      if (initial.reason === "abi-mismatch") {
+        api.logger.warn(
+          `memos-local: better-sqlite3 native binding was compiled against a different ` +
+          `Node.js ABI than the Gateway runtime (NODE_MODULE_VERSION=${nodeAbi}, Node ${process.version}). ` +
+          `Rebuilding with the Gateway's own Node binary (${process.execPath}) — this is the Issue #1734 fix path.`,
+        );
+      } else {
+        api.logger.warn(
+          `memos-local: better-sqlite3 not loadable from ${pluginDir} (reason=${initial.reason}), ` +
+          `attempting auto-rebuild pinned to Node ${process.version} (${process.execPath}) ...`,
+        );
+      }
+      if (initial.message) api.logger.warn(`memos-local: load error detail: ${initial.message.slice(0, 300)}`);
 
       try {
-        const rebuildResult = runNpm(["rebuild", "better-sqlite3"]);
+        // CRITICAL (Issue #1734): rebuildBetterSqlite3 pins npm + node-gyp to
+        // process.execPath so the rebuild ABI always matches the current Node
+        // runtime — even when the user's `npm` on PATH points at a different
+        // Node installation (Homebrew vs nvm vs system).
+        const rebuildResult = rebuildBetterSqlite3({ pluginDir, timeoutMs: 120_000 });
 
         const stdout = rebuildResult.stdout?.toString() || "";
         const stderr = rebuildResult.stderr?.toString() || "";
@@ -237,11 +283,17 @@ const memosLocalPlugin = {
           Object.keys(localRequire.cache)
             .filter(k => k.includes("better-sqlite3") || k.includes("better_sqlite3"))
             .forEach(k => delete localRequire.cache[k]);
-          sqliteReady = trySqliteLoad();
+          loadResult = trySqliteLoad();
+          sqliteReady = loadResult.ok;
           if (sqliteReady) {
-            api.logger.info("memos-local: better-sqlite3 auto-rebuild succeeded!");
+            api.logger.info(
+              `memos-local: better-sqlite3 auto-rebuild succeeded (ABI ${nodeAbi}, Node ${process.version}).`,
+            );
           } else {
-            api.logger.warn("memos-local: rebuild exited 0 but module still not loadable from plugin dir");
+            api.logger.warn(
+              `memos-local: rebuild exited 0 but module still not loadable ` +
+              `(reason=${failureInfo(loadResult).reason})`,
+            );
           }
         } else {
           api.logger.warn(`memos-local: rebuild exited with code ${rebuildResult.status}`);
@@ -254,16 +306,20 @@ const memosLocalPlugin = {
         const nodeVer = process.version;
         const nodeMajor = parseInt(process.versions?.node?.split(".")[0] ?? "0", 10);
         const isNode25Plus = nodeMajor >= 25;
+        const finalReason = failureInfo(loadResult).reason;
         const lines = [
           "",
           "╔══════════════════════════════════════════════════════════════╗",
           "║  MemOS Local Memory — better-sqlite3 native module missing  ║",
           "╠══════════════════════════════════════════════════════════════╣",
           "║                                                            ║",
-          "║  Auto-rebuild failed (Node " + nodeVer + "). Run manually:              ║",
+          `║  Auto-rebuild failed (Node ${nodeVer}, reason=${finalReason}).${" ".repeat(Math.max(0, 12 - finalReason.length))}║`,
+          "║  Run manually with the SAME Node binary used by the        ║",
+          "║  Gateway (this is what fixes Issue #1734):                 ║",
           "║                                                            ║",
           `║  cd ${pluginDir}`,
-          "║  npm rebuild better-sqlite3                                ║",
+          `║  ${process.execPath} \\`,
+          `║    $(command -v npm) rebuild better-sqlite3                ║`,
           "║  openclaw gateway stop && openclaw gateway start           ║",
           "║                                                            ║",
           "║  If rebuild fails, install build tools first:              ║",
@@ -280,7 +336,10 @@ const memosLocalPlugin = {
         lines.push("");
         api.logger.warn(lines.join("\n"));
         throw new Error(
-          `better-sqlite3 native module not found (Node ${nodeVer}). Auto-rebuild failed. Fix: install build tools, then cd ${pluginDir} && npm rebuild better-sqlite3. Or use Node LTS (20/22).`
+          `better-sqlite3 native module not loadable under Node ${nodeVer} (reason=${finalReason}). ` +
+          `Auto-rebuild (pinned to ${process.execPath}) failed. ` +
+          `Fix: install build tools, then run \`${process.execPath} $(command -v npm) rebuild better-sqlite3\` in ${pluginDir}. ` +
+          `Or use Node LTS (20/22).`,
         );
       }
     }

@@ -26,6 +26,28 @@ function phase(n, title) {
 const pluginDir = path.resolve(__dirname, "..");
 const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
+/**
+ * Build a child-process env that forces npm / node-gyp to use the *current*
+ * Node binary (`process.execPath`) instead of whatever `node` is found on
+ * PATH first. This is the postinstall-side mirror of the Issue #1734 fix
+ * applied in src/storage/rebuild-native.ts — keeping the two paths in sync
+ * means the binding always targets the same ABI no matter which entry
+ * point triggers the rebuild.
+ */
+function buildPinnedNodeEnv() {
+  const execDir = path.dirname(process.execPath);
+  const existingPath = process.env.PATH || process.env.Path || process.env.path || "";
+  const pinnedPath = existingPath
+    ? execDir + path.delimiter + existingPath
+    : execDir;
+  return {
+    ...process.env,
+    PATH: pinnedPath,
+    npm_node_execpath: process.execPath,
+    NODE: process.execPath,
+  };
+}
+
 function normalizePathForMatch(p) {
   return path.resolve(p).replace(/^\\\\\?\\/, "").replace(/\\/g, "/").toLowerCase();
 }
@@ -163,6 +185,7 @@ function ensureDependencies() {
     stdio: "pipe",
     shell: false,
     timeout: 120_000,
+    env: buildPinnedNodeEnv(),
   });
   const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
   const stderr = (result.stderr || "").toString().trim();
@@ -422,6 +445,7 @@ if (sqliteBindingsExist()) {
     stdio: "pipe",
     shell: false,
     timeout: 180_000,
+    env: buildPinnedNodeEnv(),
   });
   const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
   const stdout = (result.stdout || "").toString().trim();
