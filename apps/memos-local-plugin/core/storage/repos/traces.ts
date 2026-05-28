@@ -176,6 +176,78 @@ export function makeTracesRepo(db: StorageDb) {
     },
 
     /**
+     * Aggregate counts the Analytics dashboard needs in one SQL pass.
+     *
+     * The previous implementation walked `list({ limit: 10_000 })` and
+     * accumulated counters in JS. That call is silently clamped to 500
+     * rows by `clampLimit` (see `_helpers.ts`), so every derived count
+     * — `writesToday`, `sessions`, `embeddings` — plateaued once the
+     * database grew past 500 traces. The Web UI then reported a hard
+     * "500" ceiling even when the table held 1000+ rows. See
+     * https://github.com/MemTensor/MemOS/issues/1593.
+     *
+     * We compute everything directly in SQL so the result tracks the
+     * real row count, not a paginated window. `startOfTodayMs` is the
+     * caller's local-midnight epoch — passed in so the day boundary
+     * matches the JS day key the viewer renders.
+     */
+    aggregateMetrics(opts: {
+      startOfTodayMs: number;
+      visibility?: { sql: string; params: Record<string, unknown> };
+    }): { writesToday: number; sessions: number; embeddings: number } {
+      const fragments: string[] = [];
+      const params: Record<string, unknown> = {
+        start_of_today: opts.startOfTodayMs,
+      };
+      if (opts.visibility) {
+        fragments.push(opts.visibility.sql);
+        Object.assign(params, opts.visibility.params);
+      }
+      const where = joinWhere(fragments);
+      const sql = `SELECT
+          SUM(CASE WHEN ts >= @start_of_today THEN 1 ELSE 0 END) AS writes_today,
+          COUNT(DISTINCT session_id) AS sessions,
+          SUM(CASE WHEN vec_summary IS NOT NULL OR vec_action IS NOT NULL THEN 1 ELSE 0 END) AS embeddings
+        FROM traces ${where}`;
+      const row = db.prepare<
+        typeof params,
+        { writes_today: number | null; sessions: number | null; embeddings: number | null }
+      >(sql).get(params);
+      return {
+        writesToday: row?.writes_today ?? 0,
+        sessions: row?.sessions ?? 0,
+        embeddings: row?.embeddings ?? 0,
+      };
+    },
+
+    /**
+     * Return raw `ts` epochs for every trace at or after `sinceMs`.
+     *
+     * The viewer's daily-writes chart needs to bucket timestamps using
+     * the JS `Date` API (so DST and local-timezone day boundaries match
+     * what the user sees in their browser). Computing the day key in
+     * JS requires the timestamps, but pulling whole rows would re-hit
+     * the `clampLimit` ceiling that triggered MemOS-1593. This method
+     * returns just the `ts` column — bypassing the cap — so the caller
+     * can bucket in JS without materialising the full trace payload.
+     */
+    listTimestampsSince(opts: {
+      sinceMs: number;
+      visibility?: { sql: string; params: Record<string, unknown> };
+    }): number[] {
+      const fragments: string[] = ["ts >= @since_ms"];
+      const params: Record<string, unknown> = { since_ms: opts.sinceMs };
+      if (opts.visibility) {
+        fragments.push(opts.visibility.sql);
+        Object.assign(params, opts.visibility.params);
+      }
+      const where = joinWhere(fragments);
+      const sql = `SELECT ts FROM traces ${where}`;
+      const rows = db.prepare<typeof params, { ts: number }>(sql).all(params);
+      return rows.map((r) => r.ts);
+    },
+
+    /**
      * Count distinct (episode_id, turn_id) groups — i.e. "memory turns",
      * where one user query + its tool sub-steps + final reply are
      * counted as 1. Used by the Memories viewer for accurate pagination.

@@ -125,6 +125,101 @@ describe("storage/repos — happy paths", () => {
     }
   });
 
+  // Regression for https://github.com/MemTensor/MemOS/issues/1593 — the
+  // metrics dashboard used to walk `traces.list({ limit: 10_000 })`,
+  // which `clampLimit` silently capped at 500 rows, so the Web UI's
+  // Memory count plateaued at 500 once the database grew beyond that.
+  // The new SQL aggregates must report the real row count.
+  it("traces: aggregateMetrics + listTimestampsSince ignore the 500-row page cap", () => {
+    const { repos, cleanup } = makeTmpDb();
+    try {
+      // Seed sessions referenced by trace FKs: one primary plus a small
+      // pool of "extras" so we can vary the session_id column and still
+      // satisfy the foreign key.
+      const sessionIds = ["s-bulk", ...Array.from({ length: 7 }, (_, i) => `s-extra-${i}`)];
+      for (const id of sessionIds) {
+        repos.sessions.upsert({
+          id,
+          agent: "openclaw",
+          startedAt: 0,
+          lastSeenAt: 0,
+          meta: {},
+        });
+      }
+      repos.episodes.insert({
+        id: "e-bulk",
+        sessionId: "s-bulk",
+        startedAt: 0,
+        endedAt: null,
+        traceIds: [],
+        rTask: null,
+        status: "open",
+      });
+
+      // Seed enough rows that the legacy `list({ limit: 10_000 })` path
+      // would have clamped at 500. Inserting 612 rows is enough to make
+      // sure the aggregate beats the cap by a comfortable margin.
+      const TOTAL = 612;
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      const startOfTodayMs = startOfToday.getTime();
+      let todayWrites = 0;
+      let withEmbeddings = 0;
+      for (let i = 0; i < TOTAL; i++) {
+        // Stagger ts so half land before "today" and half after, plus
+        // toggle vectors on every other row to exercise the embeddings
+        // CASE branch and the session-distinctness counter.
+        const ts = i < 300 ? startOfTodayMs - (300 - i) * 1_000 : startOfTodayMs + (i - 300) * 1_000;
+        if (ts >= startOfTodayMs) todayWrites += 1;
+        const hasVec = i % 2 === 0;
+        if (hasVec) withEmbeddings += 1;
+        repos.traces.insert({
+          id: `tr-${i}`,
+          episodeId: "e-bulk",
+          sessionId: i % 3 === 0 ? "s-bulk" : `s-extra-${i % 7}`,
+          ts,
+          userText: "",
+          agentText: "",
+          toolCalls: [],
+          reflection: null,
+          value: 0,
+          alpha: 0,
+          rHuman: null,
+          priority: 0,
+          tags: [],
+          vecSummary: hasVec ? vec([i, 0]) : null,
+          vecAction: null,
+          // Use a distinct turnId per row so `countTurns` matches `TOTAL`.
+          turnId: i as never,
+          schemaVersion: 1,
+        });
+      }
+
+      // `list()` is still page-limited — proves the cap is real and the
+      // legacy implementation would have missed everything past row 500.
+      expect(repos.traces.list({ limit: 10_000 }).length).toBeLessThanOrEqual(500);
+
+      // The new SQL aggregates must see every row.
+      const stats = repos.traces.aggregateMetrics({ startOfTodayMs });
+      expect(stats.writesToday).toBe(todayWrites);
+      expect(stats.embeddings).toBe(withEmbeddings);
+      // Distinct sessions = "s-bulk" + 7 "s-extra-*" buckets.
+      expect(stats.sessions).toBe(8);
+
+      // countTurns is the source for the "Memories" KPI — confirm it
+      // also reports every row, not just the first page.
+      expect(repos.traces.countTurns({})).toBe(TOTAL);
+
+      // The viewer needs ts past row 500 to draw its daily-writes chart.
+      const tsList = repos.traces.listTimestampsSince({
+        sinceMs: 0,
+      });
+      expect(tsList.length).toBe(TOTAL);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("policies: upsert + stats + vector filter by status", () => {
     const { repos, cleanup } = makeTmpDb();
     try {

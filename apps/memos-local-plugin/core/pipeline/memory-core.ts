@@ -3054,24 +3054,39 @@ export function createMemoryCore(
     const oneDayMs = 86_400_000;
     const sinceMs = now - days * oneDayMs;
 
-    const traces = handle.repos.traces.list({ limit: 10_000 });
-    const sessions = new Set<string>();
-    let writesToday = 0;
-    let embeddings = 0;
-    const dayBuckets = new Map<string, number>();
+    // ── Trace aggregates (writesToday / sessions / embeddings / dailyWrites) ──
+    //
+    // We used to materialise `handle.repos.traces.list({ limit: 10_000 })`
+    // and accumulate these counts in JS. That request silently clamped
+    // to 500 rows via `clampLimit`, so every metric here plateaued once
+    // the database grew past 500 traces — the Web UI then reported a
+    // bogus "500" Memory count even with thousands of rows. See
+    // https://github.com/MemTensor/MemOS/issues/1593.
+    //
+    // We now defer counting to SQL aggregates that bypass pagination,
+    // and only fetch the lightweight `ts` column when we need it for
+    // local-timezone day bucketing.
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
+    const visibility = visibilityWhere(activeNamespace);
+    const traceStats = handle.repos.traces.aggregateMetrics({
+      startOfTodayMs: startOfToday.getTime(),
+      visibility,
+    });
+    const writesToday = traceStats.writesToday;
+    const embeddings = traceStats.embeddings;
+    const sessionsCount = traceStats.sessions;
 
-    for (const t of traces) {
-      sessions.add(t.sessionId);
-      if (t.vecSummary || t.vecAction) embeddings++;
-      if (t.ts >= startOfToday.getTime()) writesToday++;
-      if (t.ts >= sinceMs) {
-        const d = new Date(t.ts);
-        d.setHours(0, 0, 0, 0);
-        const key = d.toISOString().slice(0, 10);
-        dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + 1);
-      }
+    const dayBuckets = new Map<string, number>();
+    const recentTs = handle.repos.traces.listTimestampsSince({
+      sinceMs,
+      visibility,
+    });
+    for (const ts of recentTs) {
+      const d = new Date(ts);
+      d.setHours(0, 0, 0, 0);
+      const key = d.toISOString().slice(0, 10);
+      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + 1);
     }
 
     // Fill missing days with 0 so the chart renders an even baseline.
@@ -3161,15 +3176,12 @@ export function createMemoryCore(
     // shows: 1 user turn = 1 memory (regardless of how many tool calls
     // / sub-steps were captured for that turn).
     // Apply namespace visibility so the count matches the filtered list.
-    const totalTurns = handle.repos.traces.countTurns(
-      {},
-      visibilityWhere(activeNamespace),
-    );
+    const totalTurns = handle.repos.traces.countTurns({}, visibility);
 
     return {
       total: totalTurns,
       writesToday,
-      sessions: sessions.size,
+      sessions: sessionsCount,
       embeddings,
       dailyWrites,
       skillStats: {
