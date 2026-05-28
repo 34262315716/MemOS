@@ -94,7 +94,12 @@ function cleanStaleArtifacts() {
 
   log(`Environment changed: ${DIM}${prevFingerprint}${RESET} → ${GREEN}${currentFingerprint}${RESET}`);
 
-  const dirsToClean = ["dist", "node_modules"];
+  // NOTE: `dist/` is intentionally excluded here. Starting with the fix for
+  // bug #1619, the published npm tarball ships compiled JS in `dist/`, and
+  // npm has already overwritten any stale `dist/` from a previous install
+  // by the time postinstall runs. Wiping it would delete the plugin entry
+  // point (`dist/index.js`) and break loading.
+  const dirsToClean = ["node_modules"];
   let cleaned = 0;
   for (const dir of dirsToClean) {
     const full = path.join(pluginDir, dir);

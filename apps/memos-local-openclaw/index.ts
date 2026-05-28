@@ -1124,7 +1124,7 @@ ${detail.content}`,
             };
           }
 
-          const groupNames = status.user.groups.map((group) => group.name);
+          const groupNames = (status.user.groups ?? []).map((group) => group.name);
           return {
             content: [{
               type: "text",
