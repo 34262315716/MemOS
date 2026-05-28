@@ -160,9 +160,32 @@ const memosLocalPlugin = {
   configSchema: pluginConfigSchema,
 
   register(api: OpenClawPluginApi) {
-    api.registerMemoryCapability({
-      promptBuilder: buildMemoryPromptSection,
-    });
+    // Defensive wrappers for optional host APIs.
+    // OpenClaw runtimes may differ across versions: some omit `api.on` or
+    // `api.registerService` entirely. Without these guards, a missing method
+    // throws partway through `register()` and aborts the remainder of setup —
+    // most importantly the ViewerServer instantiation and self-start fallback,
+    // leaving port 18799 unbound (issue #1639).
+    const safeOn = (event: string, handler: (...args: any[]) => any): void => {
+      const onFn = (api as any).on;
+      if (typeof onFn !== "function") {
+        api.logger.warn(`memos-local: api.on() not available on this OpenClaw runtime; "${event}" hook disabled`);
+        return;
+      }
+      try {
+        onFn.call(api, event, handler);
+      } catch (err) {
+        api.logger.warn(`memos-local: api.on("${event}") registration failed: ${String(err)}`);
+      }
+    };
+
+    try {
+      api.registerMemoryCapability({
+        promptBuilder: buildMemoryPromptSection,
+      });
+    } catch (err) {
+      api.logger.warn(`memos-local: api.registerMemoryCapability failed: ${String(err)}`);
+    }
 
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     const localRequire = createRequire(import.meta.url);
@@ -1863,7 +1886,7 @@ Groups: ${groupNames.length > 0 ? groupNames.join(", ") : "(none)"}`,
 
     // ─── Auto-recall: inject relevant memories before agent starts ───
 
-    api.on("before_prompt_build", async (event: { prompt?: string; messages?: unknown[] }, hookCtx?: { agentId?: string; sessionKey?: string }) => {
+    safeOn("before_prompt_build", async (event: { prompt?: string; messages?: unknown[] }, hookCtx?: { agentId?: string; sessionKey?: string }) => {
       if (!allowPromptInjection) return {};
       if (!event.prompt || event.prompt.length < 3) return;
 
@@ -2158,7 +2181,7 @@ Groups: ${groupNames.length > 0 ? groupNames.join(", ") : "(none)"}`,
     // already processed before the restart) and only capture future increments.
     const sessionMsgCursor = new Map<string, number>();
 
-    api.on("agent_end", async (event: any, hookCtx?: { agentId?: string; sessionKey?: string; sessionId?: string }) => {
+    safeOn("agent_end", async (event: any, hookCtx?: { agentId?: string; sessionKey?: string; sessionId?: string }) => {
       if (!event.success || !event.messages || event.messages.length === 0) return;
 
       try {
@@ -2425,28 +2448,45 @@ Groups: ${groupNames.length > 0 ? groupNames.join(", ") : "(none)"}`,
       );
     };
 
-    api.registerService({
-      id: "memos-local-openclaw-plugin",
-      start: async () => { await startServiceCore(); },
-      stop: async () => {
-        await worker.flush();
-        await telemetry.shutdown();
-        await hubServer?.stop();
-        viewer.stop();
-        store.close();
-        api.logger.info("memos-local: stopped");
-      },
-    });
+    let serviceRegistered = false;
+    try {
+      if (typeof (api as any).registerService === "function") {
+        api.registerService({
+          id: "memos-local-openclaw-plugin",
+          start: async () => { await startServiceCore(); },
+          stop: async () => {
+            await worker.flush();
+            await telemetry.shutdown();
+            await hubServer?.stop();
+            viewer.stop();
+            store.close();
+            api.logger.info("memos-local: stopped");
+          },
+        });
+        serviceRegistered = true;
+      } else {
+        api.logger.warn("memos-local: api.registerService() not available on this OpenClaw runtime; viewer will be self-started");
+      }
+    } catch (err) {
+      api.logger.warn(`memos-local: api.registerService failed: ${String(err)}. Viewer will be self-started.`);
+    }
 
     // Fallback: OpenClaw may load this plugin via deferred reload after
     // startPluginServices has already run, so service.start() never fires.
     // Start on the next tick instead of waiting several seconds; the
     // serviceStarted guard still prevents duplicate startup if the host calls
     // service.start() immediately after registration.
+    //
+    // We also use this path when `api.registerService` isn't available on
+    // the host (older OpenClaw runtimes), so the viewer always comes up.
     const SELF_START_DELAY_MS = 0;
     setTimeout(() => {
       if (!serviceStarted) {
-        api.logger.info("memos-local: service.start() not called by host, self-starting viewer...");
+        if (serviceRegistered) {
+          api.logger.info("memos-local: service.start() not called by host, self-starting viewer...");
+        } else {
+          api.logger.info("memos-local: self-starting viewer (no service lifecycle hook available)...");
+        }
         startServiceCore().catch((err) => {
           api.logger.warn(`memos-local: self-start failed: ${err}`);
         });
